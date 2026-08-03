@@ -55,6 +55,9 @@ import type {
   ProviderCategory,
   ClaudeApiFormat,
   ClaudeApiKeyField,
+  ModelRole,
+  ModelFamilyRoute,
+  ModelFamilyRouteMap,
 } from "@/types";
 import {
   hasClaudeOneMMarker,
@@ -152,6 +155,12 @@ interface ClaudeFormFieldsProps {
   isFullUrl: boolean;
   onFullUrlChange: (value: boolean) => void;
 
+  // 模型家族路由（Claude Code 各角色 → 独立上游供应商）
+  modelFamilyRoutes?: ModelFamilyRouteMap;
+  onConfigureRoute?: (role: ModelRole, route: ModelFamilyRoute | null) => void;
+  // 是否处于 Claude 本地路由（代理接管）模式
+  isProxyTakeover?: boolean;
+
   // Local proxy User-Agent override
   customUserAgent: string;
   onCustomUserAgentChange: (value: string) => void;
@@ -218,6 +227,9 @@ export function ClaudeFormFields({
   onApiKeyFieldChange,
   isFullUrl,
   onFullUrlChange,
+  modelFamilyRoutes,
+  onConfigureRoute,
+  isProxyTakeover,
   customUserAgent,
   onCustomUserAgentChange,
   localProxyHeadersOverride,
@@ -967,10 +979,19 @@ export function ClaudeFormFields({
               <p className="text-xs text-muted-foreground">
                 {t("providerForm.modelMappingHint")}
               </p>
+              <p className="text-xs text-muted-foreground">
+                {isProxyTakeover
+                  ? t("providerForm.modelRouteHintActive", {
+                      defaultValue: "模型家族路由已生效（Claude 本地路由接管中）",
+                    })
+                  : t("providerForm.modelRouteHint", {
+                      defaultValue: "模型家族路由需在 Claude 本地路由开启时生效",
+                    })}
+              </p>
             </div>
 
             <div className="space-y-3">
-              <div className="hidden grid-cols-[120px_1fr_minmax(0,1fr)_104px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+              <div className="hidden grid-cols-[120px_1fr_minmax(0,1fr)_104px_96px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
                 <span>
                   {t("providerForm.modelRoleLabel", {
                     defaultValue: "模型角色",
@@ -991,17 +1012,26 @@ export function ClaudeFormFields({
                     defaultValue: "声明支持 1M",
                   })}
                 </span>
+                <span>
+                  {t("providerForm.modelRouteHeader", {
+                    defaultValue: "配置路由",
+                  })}
+                </span>
               </div>
 
               {modelRoleRows.map((row) => {
                 const modelBase = stripClaudeOneMMarker(row.model);
                 const usesOneM =
                   row.supportsOneM && hasClaudeOneMMarker(row.model);
+                const route = modelFamilyRoutes?.[row.role];
+                const isRouteConfigured = Boolean(
+                  route && route.name && route.baseUrl,
+                );
 
                 return (
                   <div
                     key={row.role}
-                    className="grid grid-cols-1 gap-2 md:grid-cols-[120px_1fr_minmax(0,1fr)_104px]"
+                    className="grid grid-cols-1 gap-2 md:grid-cols-[120px_1fr_minmax(0,1fr)_104px_96px]"
                   >
                     <div className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm font-medium text-muted-foreground">
                       {row.label}
@@ -1030,20 +1060,28 @@ export function ClaudeFormFields({
                         })}
                       </div>
                     )}
-                    {renderModelInput(
-                      row.inputId,
-                      modelBase,
-                      row.modelField,
-                      t("providerForm.modelPlaceholder", { defaultValue: "" }),
-                      (value) =>
-                        handleRoleModelChange(
-                          row,
-                          row.supportsOneM
-                            ? setClaudeOneMMarker(value, usesOneM)
-                            : stripClaudeOneMMarker(value),
-                        ),
+                    {isRouteConfigured ? (
+                      <div className="flex h-9 items-center rounded-md border border-blue-500/40 bg-blue-500/5 px-3 text-sm font-medium text-blue-500">
+                        {route!.name}
+                      </div>
+                    ) : (
+                      renderModelInput(
+                        row.inputId,
+                        modelBase,
+                        row.modelField,
+                        t("providerForm.modelPlaceholder", {
+                          defaultValue: "",
+                        }),
+                        (value) =>
+                          handleRoleModelChange(
+                            row,
+                            row.supportsOneM
+                              ? setClaudeOneMMarker(value, usesOneM)
+                              : stripClaudeOneMMarker(value),
+                          ),
+                      )
                     )}
-                    {row.supportsOneM && (
+                    {row.supportsOneM ? (
                       <label className="flex h-9 items-center gap-2 text-sm text-muted-foreground">
                         <Checkbox
                           checked={usesOneM}
@@ -1055,7 +1093,33 @@ export function ClaudeFormFields({
                           defaultValue: "1M",
                         })}
                       </label>
+                    ) : (
+                      <div />
                     )}
+                    <div className="flex h-9 items-center">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => onConfigureRoute?.(row.role, route ?? null)}
+                        className={
+                          isRouteConfigured
+                            ? "w-full gap-1 border-blue-500/60 shadow-[0_0_10px_rgba(59,130,246,0.35)]"
+                            : "w-full gap-1"
+                        }
+                      >
+                        {isRouteConfigured && (
+                          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-blue-500" />
+                        )}
+                        <span className="truncate">
+                          {isRouteConfigured
+                            ? route!.name
+                            : t("providerForm.modelRouteConfigure", {
+                                defaultValue: "配置路由",
+                              })}
+                        </span>
+                      </Button>
+                    </div>
                   </div>
                 );
               })}

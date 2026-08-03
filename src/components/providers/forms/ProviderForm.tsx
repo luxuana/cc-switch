@@ -23,6 +23,9 @@ import type {
   CodexChatReasoning,
   PromptCacheRoutingMode,
   ClaudeApiKeyField,
+  ModelRole,
+  ModelFamilyRoute,
+  ModelFamilyRouteMap,
 } from "@/types";
 import {
   providerPresets,
@@ -76,6 +79,7 @@ import { Label } from "@/components/ui/label";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
 import { BasicFormFields } from "./BasicFormFields";
 import { ClaudeFormFields } from "./ClaudeFormFields";
+import { ModelFamilyRouteEditor } from "./ModelFamilyRouteEditor";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { GrokBuildProviderForm } from "./GrokBuildProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
@@ -375,6 +379,8 @@ function ProviderFormFull({
         initialData?.meta?.localProxyRequestOverrides?.body,
       ),
     );
+    setModelFamilyRoutes(initialData?.meta?.modelFamilyRoutes ?? {});
+    setEditingRoute(null);
   }, [appId, initialData, supportsFullUrl]);
 
   const defaultValues: ProviderFormData = useMemo(
@@ -567,6 +573,17 @@ function ProviderFormFull({
         initialData?.meta?.localProxyRequestOverrides?.body,
       ),
   );
+
+  // 模型家族路由：Claude Code 各角色 → 独立上游供应商（仅存于 meta，不写 live）
+  const [modelFamilyRoutes, setModelFamilyRoutes] =
+    useState<ModelFamilyRouteMap>(
+      () => initialData?.meta?.modelFamilyRoutes ?? {},
+    );
+
+  const [editingRoute, setEditingRoute] = useState<{
+    role: ModelRole;
+    route: ModelFamilyRoute | null;
+  } | null>(null);
 
   const {
     codexAuth,
@@ -1540,6 +1557,36 @@ function ProviderFormFull({
     const baseMeta: ProviderMeta | undefined =
       payload.meta ?? (initialData?.meta ? { ...initialData.meta } : undefined);
 
+    // 模型家族路由：只保留 name/baseUrl 均非空的条目，避免空路由落入 meta；
+    // 可选字段空字符串/默认值不落盘（与编辑器 handleSave 口径一致，防止 DB 残留空值）。
+    const cleanModelFamilyRoutes: ModelFamilyRouteMap = {};
+    for (const [role, route] of Object.entries(modelFamilyRoutes) as Array<
+      [ModelRole, ModelFamilyRoute]
+    >) {
+      if (route && route.name.trim() && route.baseUrl.trim()) {
+        const trimmed: ModelFamilyRoute = {
+          name: route.name.trim(),
+          baseUrl: route.baseUrl.trim(),
+        };
+        if (route.apiKey?.trim()) trimmed.apiKey = route.apiKey.trim();
+        if (route.apiKeyField && route.apiKeyField !== "ANTHROPIC_AUTH_TOKEN") {
+          trimmed.apiKeyField = route.apiKeyField;
+        }
+        if (route.apiFormat && route.apiFormat !== "anthropic") {
+          trimmed.apiFormat = route.apiFormat;
+        }
+        if (route.model?.trim()) trimmed.model = route.model.trim();
+        if (route.isFullUrl) trimmed.isFullUrl = true;
+        cleanModelFamilyRoutes[role] = trimmed;
+      }
+    }
+    const hasModelFamilyRoutes = Object.keys(cleanModelFamilyRoutes).length > 0;
+
+    // 清空路由时需把 baseMeta 里遗留的旧路由一并移除，否则会残留空 map
+    if (baseMeta && "modelFamilyRoutes" in baseMeta) {
+      delete baseMeta.modelFamilyRoutes;
+    }
+
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType = presetProviderType || initialData?.meta?.providerType;
 
@@ -1654,6 +1701,10 @@ function ProviderFormFull({
         localIsFullUrl
           ? true
           : undefined,
+      // 模型家族路由：仅当存在非空路由时合并进 meta（与后端 HashMap 契约一致）
+      ...(hasModelFamilyRoutes
+        ? { modelFamilyRoutes: cleanModelFamilyRoutes }
+        : {}),
     };
 
     if (!isCodexOauthProvider && "codexFastMode" in nextMeta) {
@@ -2267,6 +2318,9 @@ function ProviderFormFull({
               onApiKeyFieldChange={handleApiKeyFieldChange}
               isFullUrl={localIsFullUrl}
               onFullUrlChange={setLocalIsFullUrl}
+              modelFamilyRoutes={modelFamilyRoutes}
+              onConfigureRoute={(role, route) => setEditingRoute({ role, route })}
+              isProxyTakeover={isProxyTakeover}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
               localProxyHeadersOverride={localProxyHeadersOverride}
@@ -2619,6 +2673,28 @@ function ProviderFormFull({
             </div>
           )}
         </form>
+
+        {/* 模型家族路由编辑弹窗：渲染在 <Form> 内以复用 FormLabel/EndpointField 上下文；
+            它本身是 Dialog，DOM 位置不影响布局 */}
+        <ModelFamilyRouteEditor
+          open={editingRoute !== null}
+          role={editingRoute?.role ?? "sonnet"}
+          initialRoute={editingRoute?.route ?? null}
+          defaultIsFullUrl={initialData?.meta?.isFullUrl ?? false}
+          onClose={() => setEditingRoute(null)}
+          onSave={(role, route) => {
+            setModelFamilyRoutes((prev) => ({ ...prev, [role]: route }));
+            setEditingRoute(null);
+          }}
+          onClear={(role) => {
+            setModelFamilyRoutes((prev) => {
+              const next = { ...prev };
+              delete next[role];
+              return next;
+            });
+            setEditingRoute(null);
+          }}
+        />
       </Form>
 
       <ConfirmDialog

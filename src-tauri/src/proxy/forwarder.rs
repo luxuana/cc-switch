@@ -1123,8 +1123,16 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        // 模型家族路由：命中已配置角色路由时，派生独立上游 Provider。
+        // 必须在 extract_base_url 之前解析，令后续全部环节（base_url / auth /
+        // 协议转换 / 模型映射 / reasoning-effort clamp）都使用路由后的 Provider。
+        // 无路由 / 无命中时行为与现状完全一致（向后兼容）。
+        let provider = super::model_mapper::resolve_model_family_route(provider, body)
+            .map(|(role, route)| super::model_mapper::derive_routed_provider(provider, role, &route))
+            .unwrap_or_else(|| provider.to_owned());
+
         // 使用适配器提取 base_url
-        let mut base_url = adapter.extract_base_url(provider)?;
+        let mut base_url = adapter.extract_base_url(&provider)?;
 
         let is_full_url = provider
             .meta
@@ -1146,11 +1154,11 @@ impl RequestForwarder {
         // below must be skipped on the Anthropic path (the marker has to survive to
         // catalog matching and to the transform's own strip+beta detection).
         let codex_responses_to_chat = matches!(app_type, AppType::Codex | AppType::GrokBuild)
-            && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
+            && super::providers::should_convert_codex_responses_to_chat(&provider, endpoint);
         let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
-            && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
+            && super::providers::should_convert_codex_responses_to_anthropic(&provider, endpoint);
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
-            && super::providers::is_codex_official_provider(provider);
+            && super::providers::is_codex_official_provider(&provider);
 
         if codex_official_auth_passthrough {
             validate_codex_official_authorization(headers)?;
@@ -1160,11 +1168,11 @@ impl RequestForwarder {
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
         let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
-            crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
+            crate::claude_desktop_config::map_proxy_request_model(body.clone(), &provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
             let (mapped_body, _original_model, _mapped_model) =
-                super::model_mapper::apply_model_mapping(body.clone(), provider);
+                super::model_mapper::apply_model_mapping(body.clone(), &provider);
             mapped_body
         };
 
@@ -1175,13 +1183,13 @@ impl RequestForwarder {
         // Route requests to the provider's real upstream model before applying
         // the optional Responses -> Chat/Anthropic bridge.
         if matches!(app_type, AppType::GrokBuild) {
-            super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            super::providers::apply_codex_upstream_model(&provider, &mut mapped_body);
         }
 
         if is_copilot {
             mapped_body =
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
-            self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
+            self.apply_copilot_live_model_resolution(&provider, &mut mapped_body)
                 .await;
             // Strip the [1M] context marker after Copilot normalization/resolve.
             // A user's mapped value (e.g. "gpt-5.6-sol[1M]") carries [1M] as a
@@ -1334,7 +1342,7 @@ impl RequestForwarder {
         }
         let resolved_claude_api_format = if adapter.name() == "Claude" {
             Some(
-                self.resolve_claude_api_format(provider, &mapped_body, is_copilot)
+                self.resolve_claude_api_format(&provider, &mapped_body, is_copilot)
                     .await,
             )
         } else {
@@ -1344,15 +1352,15 @@ impl RequestForwarder {
             if let Some(api_format) = resolved_claude_api_format.as_deref() {
                 super::providers::normalize_anthropic_messages_for_provider(
                     &mut mapped_body,
-                    provider,
+                    &provider,
                     api_format,
                 );
-                self.apply_media_prevention(&mut mapped_body, provider);
+                self.apply_media_prevention(&mut mapped_body, &provider);
             }
         }
         let needs_transform = match resolved_claude_api_format.as_deref() {
             Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
-            None => adapter.needs_transform(provider),
+            None => adapter.needs_transform(&provider),
         };
         // Codex → Anthropic: Claude Code emulation is off by default and only
         // enabled when the user explicitly turns it on in the UI, so requests can
@@ -1373,7 +1381,7 @@ impl RequestForwarder {
         } else if needs_transform && adapter.name() == "Claude" {
             let api_format = resolved_claude_api_format
                 .as_deref()
-                .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
+                .unwrap_or_else(|| super::providers::get_claude_api_format(&provider));
             rewrite_claude_transform_endpoint(endpoint, api_format, is_copilot, &mapped_body)
         } else {
             (
@@ -1439,15 +1447,15 @@ impl RequestForwarder {
                     "[Codex] Restored or enriched {restored} cached function call item(s) for Chat upstream"
                 );
             }
-            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            super::providers::apply_codex_chat_upstream_model(&provider, &mut mapped_body);
             let reasoning_config =
-                super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
+                super::providers::resolve_codex_chat_reasoning_config(&provider, &mapped_body);
             let mut chat_body = super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
                 mapped_body,
                 reasoning_config.as_ref(),
             )?;
             super::providers::inject_codex_chat_prompt_cache_key(
-                provider,
+                &provider,
                 &mut chat_body,
                 explicit_prompt_cache_key.as_deref(),
                 self.session_client_provided
@@ -1456,7 +1464,7 @@ impl RequestForwarder {
             chat_body
         } else if codex_responses_to_anthropic {
             let mut mapped_body = mapped_body;
-            super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+            super::providers::apply_codex_upstream_model(&provider, &mut mapped_body);
             // Per-provider output ceiling override. Codex does not forward its
             // `model_max_output_tokens` in the request body, so honor the value
             // configured on the provider here — it takes precedence over any
@@ -1514,17 +1522,17 @@ impl RequestForwarder {
             if adapter.name() == "Claude" {
                 let api_format = resolved_claude_api_format
                     .as_deref()
-                    .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
+                    .unwrap_or_else(|| super::providers::get_claude_api_format(&provider));
                 super::providers::transform_claude_request_for_api_format(
                     mapped_body,
-                    provider,
+                    &provider,
                     api_format,
                     self.session_client_provided
                         .then_some(self.session_id.as_str()),
                     Some(self.gemini_shadow.as_ref()),
                 )?
             } else {
-                adapter.transform_request(mapped_body, provider)?
+                adapter.transform_request(mapped_body, &provider)?
             }
         } else {
             mapped_body
@@ -1540,7 +1548,7 @@ impl RequestForwarder {
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
-            && super::providers::provider_needs_responses_namespace_flatten(provider)
+            && super::providers::provider_needs_responses_namespace_flatten(&provider)
             && super::providers::transform_codex_responses_namespace::flatten_request_namespaces(
                 &mut request_body,
             )?
@@ -1561,7 +1569,7 @@ impl RequestForwarder {
         if matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && !codex_responses_to_chat
             && !codex_responses_to_anthropic
-            && super::providers::provider_needs_responses_namespace_flatten(provider)
+            && super::providers::provider_needs_responses_namespace_flatten(&provider)
             && super::providers::transform_codex_responses_xai_sanitize::sanitize_xai_responses_request(
                 &mut request_body,
             )
@@ -1573,7 +1581,7 @@ impl RequestForwarder {
         }
 
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
-            self.apply_media_prevention(&mut request_body, provider);
+            self.apply_media_prevention(&mut request_body, &provider);
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
@@ -1600,7 +1608,7 @@ impl RequestForwarder {
         }
         log_prompt_cache_trace(
             app_type,
-            provider,
+            &provider,
             &effective_endpoint,
             resolved_claude_api_format.as_deref(),
             &filtered_body,
@@ -1620,7 +1628,7 @@ impl RequestForwarder {
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
+        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(&provider) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
                 if let Some(app_handle) = &self.app_handle {
@@ -2216,7 +2224,7 @@ impl RequestForwarder {
 
         let preserve_exact_header_case = should_preserve_exact_header_case(
             adapter.name(),
-            provider,
+            &provider,
             resolved_claude_api_format.as_deref(),
             is_copilot,
         );

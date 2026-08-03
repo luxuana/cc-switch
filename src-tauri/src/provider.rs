@@ -418,6 +418,74 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+/// Claude Code 各模型角色（模型家族路由的 key，与前端 TS 的 ModelRole 对齐）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelRole {
+    Sonnet,
+    Opus,
+    Fable,
+    Haiku,
+    Subagent,
+}
+
+impl ModelRole {
+    /// 路由表 key（与前端 TS `ModelRole` 字符串字面量严格一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelRole::Sonnet => "sonnet",
+            ModelRole::Opus => "opus",
+            ModelRole::Fable => "fable",
+            ModelRole::Haiku => "haiku",
+            ModelRole::Subagent => "subagent",
+        }
+    }
+
+    /// 该角色对应的 Claude Code env 模型键（模型映射/检测键）。
+    pub fn env_key(&self) -> &'static str {
+        match self {
+            ModelRole::Sonnet => "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ModelRole::Opus => "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            ModelRole::Fable => "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            ModelRole::Haiku => "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            ModelRole::Subagent => "CLAUDE_CODE_SUBAGENT_MODEL",
+        }
+    }
+}
+
+/// 单个模型角色的独立上游供应商配置（模型家族路由）。
+///
+/// serde 字段名必须与前端 TS `ModelFamilyRoute` 严格一致。
+/// 仅存于 DB meta 列，不写入 live 配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ModelFamilyRoute {
+    /// 供应商名称（显示在「实际请求模型」输入框）
+    pub name: String,
+    /// 上游 base_url
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    /// API Key
+    #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// 认证字段名（ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY）
+    #[serde(rename = "apiKeyField", skip_serializing_if = "Option::is_none")]
+    pub api_key_field: Option<String>,
+    /// API 格式（anthropic / openai_chat / openai_responses / gemini_native）
+    #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
+    pub api_format: Option<String>,
+    /// 该角色的目标模型（弹窗「目标模型」输入框，缺省则透传请求模型）。
+    ///
+    /// 双重语义：
+    /// - **上游**：代理命中该角色路由时把 `body.model` 改写为该值发给上游。
+    /// - **客户端显示名 / 能力判定**：接管时 `ANTHROPIC_DEFAULT_*_MODEL` 写入该值
+    ///   （替代固定接管别名如 `claude-sonnet-4-6`），Claude Code 显示它并按它做
+    ///   能力判定（如 xhigh 思考支持）。用户填什么，客户端就按什么判定。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 是否将 base_url 视为完整端点（代理不拼接路径）
+    #[serde(rename = "isFullUrl", skip_serializing_if = "Option::is_none")]
+    pub is_full_url: Option<bool>,
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -440,6 +508,14 @@ pub struct ProviderMeta {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub claude_desktop_model_routes: HashMap<String, ClaudeDesktopModelRoute>,
+    /// 模型家族路由：Claude Code 各模型角色 → 独立上游供应商。
+    /// 仅存于 DB meta 列（~/.cc-switch/config.json），不写入 live 配置。
+    #[serde(
+        default,
+        rename = "modelFamilyRoutes",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub model_family_routes: HashMap<String, ModelFamilyRoute>,
     /// 用量查询脚本配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_script: Option<UsageScript>,
@@ -996,7 +1072,8 @@ pub struct OpenCodeModelLimit {
 mod tests {
     use super::{
         ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        ModelFamilyRoute, ModelRole, OpenCodeProviderConfig, Provider, ProviderManager,
+        ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1076,6 +1153,86 @@ mod tests {
         let overrides = decoded.local_proxy_request_overrides.unwrap();
         assert_eq!(overrides.headers.get("X-Test"), Some(&"yes".to_string()));
         assert_eq!(overrides.body.unwrap()["temperature"], 0.2);
+    }
+
+    #[test]
+    fn model_family_routes_serde_contract_matches_frontend() {
+        // 契约测试：字段名与前端 TS ModelFamilyRoute 严格一致
+        let meta = ProviderMeta {
+            model_family_routes: HashMap::from([(
+                "sonnet".to_string(),
+                ModelFamilyRoute {
+                    name: "Sonnet Upstream".to_string(),
+                    base_url: "https://up.example".to_string(),
+                    api_key: Some("sk-1".to_string()),
+                    api_key_field: Some("ANTHROPIC_API_KEY".to_string()),
+                    api_format: Some("openai_chat".to_string()),
+                    model: Some("deepseek-sonnet".to_string()),
+                    is_full_url: Some(true),
+                },
+            )]),
+            ..ProviderMeta::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+        let routes = value["modelFamilyRoutes"]
+            .as_object()
+            .expect("modelFamilyRoutes object");
+        assert_eq!(routes.len(), 1);
+        let route = &routes["sonnet"];
+        assert_eq!(route["name"], "Sonnet Upstream");
+        assert_eq!(route["baseUrl"], "https://up.example");
+        assert_eq!(route["apiKey"], "sk-1");
+        assert_eq!(route["apiKeyField"], "ANTHROPIC_API_KEY");
+        assert_eq!(route["apiFormat"], "openai_chat");
+        assert_eq!(route["model"], "deepseek-sonnet");
+        assert_eq!(route["isFullUrl"], true);
+        // 无 snake_case 泄漏
+        assert!(route.get("base_url").is_none());
+        assert!(route.get("api_key").is_none());
+        assert!(route.get("api_format").is_none());
+        assert!(route.get("model_name").is_none());
+        assert!(route.get("is_full_url").is_none());
+        // modelName 字段已移除（客户端显示名跟随「目标模型」model）
+        assert!(route.get("modelName").is_none());
+
+        // 往返
+        let decoded: ProviderMeta =
+            serde_json::from_value(value).expect("deserialize ProviderMeta");
+        let decoded_route = &decoded.model_family_routes["sonnet"];
+        assert_eq!(decoded_route.base_url, "https://up.example");
+        assert_eq!(decoded_route.api_key.as_deref(), Some("sk-1"));
+        assert_eq!(decoded_route.is_full_url, Some(true));
+    }
+
+    #[test]
+    fn model_family_routes_omitted_when_empty() {
+        // skip_serializing_if = HashMap::is_empty
+        let value = serde_json::to_value(ProviderMeta::default()).expect("serialize ProviderMeta");
+        assert!(value.get("modelFamilyRoutes").is_none());
+    }
+
+    #[test]
+    fn model_role_env_keys_match_claude_code_fields() {
+        assert_eq!(
+            ModelRole::Sonnet.env_key(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL"
+        );
+        assert_eq!(ModelRole::Opus.env_key(), "ANTHROPIC_DEFAULT_OPUS_MODEL");
+        assert_eq!(
+            ModelRole::Fable.env_key(),
+            "ANTHROPIC_DEFAULT_FABLE_MODEL"
+        );
+        assert_eq!(
+            ModelRole::Haiku.env_key(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+        );
+        assert_eq!(ModelRole::Subagent.env_key(), "CLAUDE_CODE_SUBAGENT_MODEL");
+        assert_eq!(ModelRole::Sonnet.as_str(), "sonnet");
+        assert_eq!(ModelRole::Opus.as_str(), "opus");
+        assert_eq!(ModelRole::Fable.as_str(), "fable");
+        assert_eq!(ModelRole::Haiku.as_str(), "haiku");
+        assert_eq!(ModelRole::Subagent.as_str(), "subagent");
     }
 
     #[test]

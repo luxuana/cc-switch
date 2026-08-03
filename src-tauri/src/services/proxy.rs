@@ -110,11 +110,17 @@ impl ProxyService {
             ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken
         };
         // Copilot/Codex 接管时 live config 可能还是旧供应商；显示模型必须跟随目标 provider。
-        let takeover_model_fields = if provider.uses_managed_account_auth() {
+        let mut takeover_model_fields = if provider.uses_managed_account_auth() {
             Self::build_claude_takeover_model_fields(&provider.settings_config)
         } else {
             Self::build_claude_takeover_model_fields(config)
         };
+        // 路由配置了「目标模型」时，接管 _MODEL 用该目标模型（替代固定接管别名）。
+        // 原因：Claude Code 客户端按 _MODEL 的值显示模型名并做能力判定
+        //（如 xhigh 思考支持），固定别名 claude-sonnet-4-6 会让客户端对 Sonnet 4.6
+        // 降级 xhigh→high；用路由目标模型（如 claude-sonnet-5）则客户端按其能力透传。
+        // 用户填什么目标模型，客户端就显示什么、按什么判定。
+        Self::add_claude_route_target_model_overrides(provider, &mut takeover_model_fields);
 
         Self::apply_claude_takeover_fields_with_policy_and_models(
             config,
@@ -319,6 +325,64 @@ impl ProxyService {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+
+    /// 路由配置了「目标模型」（`meta.model_family_routes[role].model`）时，
+    /// 接管 `ANTHROPIC_DEFAULT_*_MODEL` 写入该目标模型（替代固定接管别名）。
+    ///
+    /// CC 端显示名与能力判定（如 xhigh 思考支持）跟随目标模型——用户填什么，
+    /// Claude Code 就按什么判定。目标模型自带 [1M] 后缀则保留（CC 用它声明
+    /// 1M 上下文能力）。未配置目标模型的路由保持 `build_claude_takeover_model_fields`
+    /// 的既有行为（固定接管别名 / 继承值）。
+    fn add_claude_route_target_model_overrides(
+        provider: &Provider,
+        fields: &mut Vec<(&'static str, String)>,
+    ) {
+        let Some(meta) = provider.meta.as_ref() else {
+            return;
+        };
+        if meta.model_family_routes.is_empty() {
+            return;
+        }
+
+        let role_fields = [
+            (
+                crate::provider::ModelRole::Haiku,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            ),
+            (
+                crate::provider::ModelRole::Sonnet,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            ),
+            (
+                crate::provider::ModelRole::Opus,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            ),
+            (
+                crate::provider::ModelRole::Fable,
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            ),
+            // subagent 的检测键 CLAUDE_CODE_SUBAGENT_MODEL 不可改写（改写会破坏
+            // subagent 检测），其路由目标由 ModelMapping 承担。
+            // subagent 角色不在此处覆盖。
+        ];
+
+        for (role, model_key) in role_fields {
+            let Some(route) = meta.model_family_routes.get(role.as_str()) else {
+                continue;
+            };
+            if route.base_url.trim().is_empty() {
+                continue;
+            }
+            let Some(target) = route.model.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            // 目标模型原样写入（自带 [1M] 则保留，CC 用它声明 1M 能力；
+            // 转发前由 strip_one_m_suffix_for_upstream 剥离）。
+            fields.retain(|(key, _)| *key != model_key);
+            fields.push((model_key, target.to_string()));
+        }
     }
 
     fn has_claude_one_m_marker(model: &str) -> bool {
@@ -3433,6 +3497,109 @@ mod tests {
         );
         assert_env_str(env, "ANTHROPIC_AUTH_TOKEN", Some(PROXY_TOKEN_PLACEHOLDER));
         assert_env_str(env, "ANTHROPIC_API_KEY", None);
+    }
+
+    #[test]
+    fn claude_takeover_uses_route_target_model_for_client_model() {
+        // 路由配置了「目标模型」时，接管 _MODEL 应写入该目标模型（替代固定接管别名
+        // claude-sonnet-4-6），令 Claude Code 客户端显示它并按它做能力判定（xhigh）。
+        let mut provider = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            model_family_routes: serde_json::from_value(json!({
+                "sonnet": {
+                    "name": "relaylink",
+                    "baseUrl": "https://api.relaylink.cloud",
+                    "model": "claude-sonnet-5[1M]"
+                }
+            }))
+            .expect("routes json"),
+            ..Default::default()
+        });
+
+        // 非 managed-account provider：接管模型字段从 live config 读取，故 live env 需含模型
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1M]"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(|value| value.as_object())
+            .expect("env should exist");
+        // 目标模型替代固定接管别名，[1M] 后缀原样保留（CC 用它声明 1M 能力）
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            Some("claude-sonnet-5[1M]"),
+        );
+        // 显示名称仍按原有逻辑（回退上游模型名）
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            Some("deepseek-v4-pro"),
+        );
+    }
+
+    #[test]
+    fn claude_takeover_keeps_fixed_alias_when_route_has_no_target_model() {
+        // 路由未配置目标模型（仅 baseUrl，透传请求模型）时，保持固定接管别名
+        // （向后兼容）。
+        let mut provider = Provider::with_id(
+            "deepseek".to_string(),
+            "DeepSeek".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            model_family_routes: serde_json::from_value(json!({
+                "sonnet": {
+                    "name": "relaylink",
+                    "baseUrl": "https://api.relaylink.cloud"
+                }
+            }))
+            .expect("routes json"),
+            ..Default::default()
+        });
+
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1M]"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(|value| value.as_object())
+            .expect("env should exist");
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            Some("claude-sonnet-4-6[1M]"),
+        );
     }
 
     #[test]

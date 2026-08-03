@@ -168,6 +168,34 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+// Claude Code 模型角色（模型家族路由的 key）
+export type ModelRole = "sonnet" | "opus" | "fable" | "haiku" | "subagent";
+
+// 单个模型角色的独立上游供应商配置（模型家族路由）。
+// 字段名与后端 serde rename 严格一致；仅存于 DB meta 列（~/.cc-switch/config.json），不写入 live 配置。
+export interface ModelFamilyRoute {
+  // 供应商名称（回显到「实际请求模型」输入框）
+  name: string;
+  // 上游 base_url（必填非空，否则视为未配置路由）
+  baseUrl: string;
+  // 可选；留空则后端继承主供应商 Key
+  apiKey?: string;
+  // 认证字段名（ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY）
+  apiKeyField?: ClaudeApiKeyField;
+  // API 格式（anthropic / openai_chat / openai_responses / gemini_native）
+  apiFormat?: ClaudeApiFormat;
+  // 该角色的目标模型（缺省则透传请求模型）。
+  // 双重语义：上游收到它（代理改写 body.model 为该值）；接管时 CC 端
+  // ANTHROPIC_DEFAULT_*_MODEL 也写它（替代固定接管别名），Claude Code 显示它
+  // 并按它做能力判定（如 xhigh 思考支持）——用户填什么，客户端就按什么判定。
+  model?: string;
+  // 是否将 base_url 视为完整端点（代理不拼接路径）
+  isFullUrl?: boolean;
+}
+
+// 模型家族路由映射：仅包含已配置的角色（与后端 HashMap 一致，允许任意子集）
+export type ModelFamilyRouteMap = Partial<Record<ModelRole, ModelFamilyRoute>>;
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -231,6 +259,9 @@ export interface ProviderMeta {
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
   githubAccountId?: string;
+  // 模型家族路由：Claude Code 各模型角色（sonnet/opus/fable/haiku/subagent）→ 独立上游供应商。
+  // 仅存于 DB meta 列（~/.cc-switch/config.json），不写入 live 配置。
+  modelFamilyRoutes?: ModelFamilyRouteMap;
 }
 
 // Skill 同步方式
