@@ -344,12 +344,11 @@ pub fn anthropic_to_responses(
     }
 
     // Map Anthropic thinking → OpenAI Responses reasoning.effort
-    if let Some(model_name) = body.get("model").and_then(|m| m.as_str()) {
-        if super::transform::supports_reasoning_effort(model_name) {
-            if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
-                result["reasoning"] = json!({ "effort": effort });
-            }
-        }
+    // 无条件透传：统一思考级别下 Claude Code CLI 会带 output_config.effort，
+    // 上游自行决定是否接受；不再用 supports_reasoning_effort 白名单过滤，
+    // 避免模型不在白名单时静默丢弃用户显式设置的思考程度。
+    if let Some(effort) = super::transform::resolve_reasoning_effort(&body) {
+        result["reasoning"] = json!({ "effort": effort });
     }
 
     // stop_sequences → 丢弃 (Responses API 不支持)
@@ -1893,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_output_config_max_sets_reasoning_xhigh() {
+    fn test_responses_output_config_max_sets_reasoning_max() {
         let input = json!({
             "model": "gpt-5.4",
             "max_tokens": 1024,
@@ -1902,7 +1901,7 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert_eq!(result["reasoning"]["effort"], "xhigh");
+        assert_eq!(result["reasoning"]["effort"], "max");
     }
 
     #[test]
@@ -1972,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_non_reasoning_model_no_reasoning() {
+    fn test_responses_thinking_fallback_injects_effort_for_any_model() {
         let input = json!({
             "model": "gpt-4o",
             "max_tokens": 1024,
@@ -1980,8 +1979,10 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         });
 
+        // 无条件透传：不再按模型白名单过滤，thinking 回退推导出的 effort 也会注入。
+        // 上游自行决定是否接受（统一思考级别下应全透传）。
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert!(result.get("reasoning").is_none());
+        assert_eq!(result["reasoning"]["effort"], json!("low"));
     }
 
     // ==================== Codex OAuth (ChatGPT 反代) 协议约束 ====================

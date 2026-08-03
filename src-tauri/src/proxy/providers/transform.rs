@@ -101,8 +101,9 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
             "low" => Some("low"),
             "medium" => Some("medium"),
             "high" => Some("high"),
-            "max" => Some("xhigh"), // OpenAI xhigh = maximum reasoning effort
-            _ => None,              // unknown value — do not inject
+            "xhigh" => Some("xhigh"), // Claude Code /effort 直接发 xhigh
+            "max" => Some("max"),     // 完全透传 max，不降级（上游自行处理）
+            _ => None,                // unknown value — do not inject
         };
     }
 
@@ -206,10 +207,11 @@ pub fn anthropic_to_openai_with_reasoning_content(
     }
 
     // Map Anthropic thinking → OpenAI reasoning_effort
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
-            result["reasoning_effort"] = json!(effort);
-        }
+    // 无条件透传：统一思考级别下 Claude Code CLI 会带 output_config.effort，
+    // 上游自行决定是否接受；不再用 supports_reasoning_effort 白名单过滤，
+    // 避免模型不在白名单时静默丢弃用户显式设置的思考程度。
+    if let Some(effort) = resolve_reasoning_effort(&body) {
+        result["reasoning_effort"] = json!(effort);
     }
 
     // 转换 tools (过滤 BatchTool)
@@ -1775,8 +1777,15 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_max_maps_to_reasoning_effort_xhigh() {
+    fn test_output_config_max_maps_to_reasoning_effort_max() {
         let body = json!({"output_config": {"effort": "max"}});
+        assert_eq!(resolve_reasoning_effort(&body), Some("max"));
+    }
+
+    #[test]
+    fn test_output_config_xhigh_maps_to_reasoning_effort_xhigh() {
+        // Claude Code /effort 直接发 xhigh，必须透传（曾因未匹配落入 _ => None 被丢弃）
+        let body = json!({"output_config": {"effort": "xhigh"}});
         assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
     }
 
@@ -1841,7 +1850,7 @@ mod tests {
     // ── Integration: anthropic_to_openai with resolve_reasoning_effort ──
 
     #[test]
-    fn test_non_reasoning_model_no_reasoning_effort() {
+    fn test_thinking_fallback_injects_effort_for_any_model() {
         let input = json!({
             "model": "gpt-4o",
             "max_tokens": 1024,
@@ -1849,8 +1858,10 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         });
 
+        // 无条件透传：不再按模型白名单过滤，thinking 回退推导出的 effort 也会注入。
+        // 上游自行决定是否接受（统一思考级别下应全透传）。
         let result = anthropic_to_openai(input).unwrap();
-        assert!(result.get("reasoning_effort").is_none());
+        assert_eq!(result.get("reasoning_effort").unwrap(), "low");
     }
 
     #[test]
@@ -1876,7 +1887,7 @@ mod tests {
         });
 
         let result = anthropic_to_openai(input).unwrap();
-        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["reasoning_effort"], "max");
     }
 
     #[test]
