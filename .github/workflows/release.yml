@@ -84,7 +84,7 @@ jobs:
 
       - name: Setup pnpm
         if: runner.os != 'Windows' || matrix.arch != 'arm64'
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@v6.0.9
         with:
           version: 10.12.3
           run_install: false
